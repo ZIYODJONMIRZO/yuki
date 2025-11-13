@@ -12,6 +12,8 @@ from PIL import Image
 from docx import Document
 from docx.oxml.ns import qn
 from dotenv import load_dotenv
+from flask import Flask
+import threading
 
 # .env faylni o'qish
 load_dotenv()
@@ -37,6 +39,14 @@ if not BOT_TOKEN or not GROQ_API_KEY:
 USER_STATE = {}
 USER_DATA = {}
 CHAT_HISTORY = {}
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot ishlayapti!", 200
+
+threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000)).start()
 
 # 🔹 Asosiy menyu
 def main_menu():
@@ -490,4 +500,5 @@ def main():
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
+
     main()
