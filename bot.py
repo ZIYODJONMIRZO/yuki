@@ -2,6 +2,7 @@ import os
 import logging
 import io
 import requests
+import asyncio
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -12,8 +13,8 @@ from PIL import Image
 from docx import Document
 from docx.oxml.ns import qn
 from dotenv import load_dotenv
-from flask import Flask
-import threading
+from flask import Flask, request
+import shutil
 
 # .env faylni o'qish
 load_dotenv()
@@ -27,12 +28,11 @@ logger = logging.getLogger(__name__)
 # 🔑 API Keys
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com
+PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not GROQ_API_KEY:
     print("❌ XATOLIK: .env faylda BOT_TOKEN va GROQ_API_KEY topilmadi!")
-    print("📝 .env faylni tekshiring:")
-    print("   BOT_TOKEN=your_telegram_token")
-    print("   GROQ_API_KEY=your_groq_key (https://console.groq.com)")
     exit(1)
 
 # 📊 Foydalanuvchi ma'lumotlari
@@ -40,15 +40,38 @@ USER_STATE = {}
 USER_DATA = {}
 CHAT_HISTORY = {}
 
+# Flask app
 app = Flask(__name__)
 
+# Telegram bot app (global)
+telegram_app = None
+
+# 🏥 Health check endpoint
 @app.route('/')
 def home():
-    return "Bot ishlayapti!", 200
+    return "✅ Bot ishlayapti!", 200
 
-threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
+@app.route('/health')
+def health():
+    return {"status": "healthy", "bot": "running"}, 200
 
-# 🔹 Asosiy menyu
+# 🪝 Webhook endpoint
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    """Telegram webhook handler"""
+    try:
+        json_data = request.get_json(force=True)
+        update = Update.de_json(json_data, telegram_app.bot)
+        
+        # Async update'ni process qilish
+        asyncio.run(telegram_app.process_update(update))
+        
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Webhook xatolik: {e}")
+        return "Error", 500
+
+# 📹 Asosiy menyu
 def main_menu():
     return ReplyKeyboardMarkup(
         [
@@ -57,36 +80,32 @@ def main_menu():
         resize_keyboard=True
     )
 
-# 🔹 Image menyusi
+# 📹 Image menyusi
 def image_menu():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("✅ Create PDF")], [KeyboardButton("🔙 Back")]],
         resize_keyboard=True
     )
 
-# 🔹 Word menyusi
+# 📹 Word menyusi
 def word_menu():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("✅ Create PDF")], [KeyboardButton("🔙 Back")]],
         resize_keyboard=True
     )
 
-# 🤖 Groq API Chatbot (BEPUL, CHEKSIZ!)
+# 🤖 Groq API Chatbot
 async def chatbot_reply(user_text: str, user_id: int) -> str:
     """Groq Llama 3.3 70B model bilan suhbat"""
     try:
-        # Suhbat tarixini olish
         if user_id not in CHAT_HISTORY:
             CHAT_HISTORY[user_id] = []
         
-        # Foydalanuvchi xabarini qo'shish
         CHAT_HISTORY[user_id].append({"role": "user", "content": user_text})
         
-        # Oxirgi 10 ta xabarni saqlash
         if len(CHAT_HISTORY[user_id]) > 10:
             CHAT_HISTORY[user_id] = CHAT_HISTORY[user_id][-10:]
         
-        # System prompt + suhbat tarixi
         messages = [
             {
                 "role": "system",
@@ -94,7 +113,6 @@ async def chatbot_reply(user_text: str, user_id: int) -> str:
             }
         ] + CHAT_HISTORY[user_id]
         
-        # Groq API so'rovi
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -112,11 +130,10 @@ async def chatbot_reply(user_text: str, user_id: int) -> str:
         
         if response.status_code == 200:
             bot_reply = response.json()["choices"][0]["message"]["content"]
-            # Bot javobini tarixga qo'shish
             CHAT_HISTORY[user_id].append({"role": "assistant", "content": bot_reply})
             return bot_reply
         else:
-            logger.error(f"Groq xatolik: {response.status_code} - {response.text}")
+            logger.error(f"Groq xatolik: {response.status_code}")
             return f"❌ API xatolik ({response.status_code}). Keyinroq urinib ko'ring."
         
     except Exception as e:
@@ -141,14 +158,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     current_state = USER_STATE.get(user_id, "main")
 
-    # 🔙 Back tugmasi
     if text == "🔙 Back":
         USER_STATE[user_id] = "main"
         USER_DATA.pop(user_id, None)
         await update.message.reply_text("🏠 Asosiy menyuga qaytdingiz.", reply_markup=main_menu())
         return
 
-    # 🖼 Image → PDF menyusi
     if text == "🖼 Image → PDF":
         USER_STATE[user_id] = "image"
         USER_DATA[user_id] = []
@@ -160,7 +175,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 📄 Word → PDF menyusi
     if text == "📄 Word → PDF":
         USER_STATE[user_id] = "word"
         os.makedirs(f"data/{user_id}", exist_ok=True)
@@ -172,17 +186,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ✅ Image PDF yaratish
     if text == "✅ Create PDF" and current_state == "image":
         await create_image_pdf(update, context)
         return
 
-    # ✅ Word PDF yaratish
     if text == "✅ Create PDF" and current_state == "word":
         await create_word_pdf(update, context)
         return
 
-    # 💬 Qolgan barcha xabarlar - Chatbot
     if current_state == "main":
         await update.message.reply_text("⏳ Javob tayyorlanmoqda...")
         reply = await chatbot_reply(text, user_id)
@@ -263,7 +274,7 @@ async def create_image_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     img = img.convert("RGB")
                     
                     img_width, img_height = img.size
-                    page_w, page_h = 210, 297  # A4
+                    page_w, page_h = 210, 297
                     margin = 10
                     available_w = page_w - 2 * margin
                     available_h = page_h - 2 * margin
@@ -283,7 +294,6 @@ async def create_image_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     temp_jpg = f"data/{user_id}/temp_{i}.jpg"
                     
-                    # Optimallashtirish
                     max_pixels = 1200 * 1200
                     current_pixels = img_width * img_height
                     
@@ -329,20 +339,10 @@ async def create_image_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ PDF yaratishda xatolik: {e}")
     
     finally:
-        for img in image_files:
-            if os.path.exists(img):
-                try:
-                    os.remove(img)
-                except:
-                    pass
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except:
-                pass
-        USER_DATA[user_id] = []
+        # Fayllarni tozalash
+        cleanup_user_data(user_id)
 
-# 🧾 MUKAMMAL Word → PDF (Krill + Rasmlar!)
+# 🧾 Word → PDF funksiyasi
 async def create_word_pdf(update, context):
     user_id = update.message.from_user.id
     word_path = USER_DATA.get(user_id)
@@ -357,24 +357,19 @@ async def create_word_pdf(update, context):
         await update.message.reply_text("⏳ PDF yaratilmoqda...")
         
         document = Document(word_path)
-        
-        # PDF yaratish (UTF-8 qo'llab-quvvatlash)
         pdf = FPDF()
         pdf.add_page()
         
-        # DejaVu font (Kriril harflarni qo'llab-quvvatlaydi)
         try:
             pdf.add_font('DejaVu', '', 'DejaVuSans.ttf', uni=True)
             pdf.set_font('DejaVu', '', 12)
         except:
-            # Agar DejaVu yo'q bo'lsa, Arial
             pdf.set_font('Arial', '', 12)
-            logger.warning("DejaVu font topilmadi, Arial ishlatilmoqda")
+            logger.warning("DejaVu font topilmadi")
 
         has_content = False
         
         for element in document.element.body:
-            # Paragraflar
             if element.tag == qn('w:p'):
                 para = None
                 for p in document.paragraphs:
@@ -399,7 +394,6 @@ async def create_word_pdf(update, context):
                                 pdf.multi_cell(0, 8, safe_text)
                                 pdf.ln(2)
             
-            # Rasmlar
             elif element.tag == qn('w:r'):
                 for drawing in element.findall('.//'+qn('a:blip')):
                     try:
@@ -414,8 +408,8 @@ async def create_word_pdf(update, context):
                                 img = img.convert('RGB')
                                 
                                 img_w, img_h = img.size
-                                max_w = 180  # mm
-                                max_h = 240  # mm
+                                max_w = 180
+                                max_h = 240
                                 
                                 ratio = min(max_w / img_w, max_h / img_h) * 25.4
                                 new_w = img_w * ratio / 25.4
@@ -454,52 +448,53 @@ async def create_word_pdf(update, context):
 
     except Exception as e:
         logger.error(f"Word PDF xatolik: {e}")
-        await update.message.reply_text(f"❌ Xatolik: {str(e)}\n\nIltimos qaytadan urinib ko'ring.")
+        await update.message.reply_text(f"❌ Xatolik: {str(e)}")
     
     finally:
-        for file_path in [word_path, pdf_path]:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-        USER_DATA[user_id] = None
+        cleanup_user_data(user_id)
+
+# 🗑️ Fayllarni tozalash
+def cleanup_user_data(user_id):
+    """Foydalanuvchi fayllarini o'chirish"""
+    try:
+        user_dir = f"data/{user_id}"
+        if os.path.exists(user_dir):
+            shutil.rmtree(user_dir)
+        USER_DATA.pop(user_id, None)
+    except Exception as e:
+        logger.error(f"Tozalash xatolik: {e}")
 
 # 🚀 Botni ishga tushirish
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    global telegram_app
+    
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
 
     # Handlerlar
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_word))
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_word))
 
-    print("🤖 Bot ishga tushdi...")
-    print("💬 Chatbot: Groq Llama 3.3 70B (BEPUL, CHEKSIZ)")
-    print("📄 Word → PDF: Krill + Rasmlar qo'llab-quvvatlanadi")
-    
-    # Render.com uchun webhook (PORT majburiy)
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 10000))
+    logger.info("🤖 Bot ishga tushdi...")
+    logger.info("💬 Chatbot: Groq Llama 3.3 70B")
+    logger.info("📄 Word → PDF: Krill + Rasmlar")
     
     if WEBHOOK_URL:
         # Webhook rejimi (Render.com)
-        print(f"🌐 Webhook rejimi: {WEBHOOK_URL}")
-        print(f"📡 Port: {PORT}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            drop_pending_updates=True
-        )
+        logger.info(f"🌐 Webhook: {WEBHOOK_URL}")
+        logger.info(f"📡 Port: {PORT}")
+        
+        # Webhook'ni o'rnatish
+        webhook_path = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        asyncio.run(telegram_app.bot.set_webhook(url=webhook_path))
+        
+        # Flask'ni ishga tushirish
+        app.run(host="0.0.0.0", port=PORT)
     else:
         # Polling rejimi (local)
-        print("🔄 Polling rejimi (local)")
-        app.run_polling(drop_pending_updates=True)
+        logger.info("🔄 Polling rejimi (local)")
+        telegram_app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-
     main()
-
