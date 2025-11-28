@@ -115,20 +115,39 @@ def word_menu():
 async def chatbot_reply(user_text: str, user_id: int) -> str:
     """Groq Llama 3.3 70B model bilan suhbat"""
     try:
+        # Chat tarixini boshlash
         if user_id not in CHAT_HISTORY:
             CHAT_HISTORY[user_id] = []
         
+        # Foydalanuvchi xabarini qo'shish
         CHAT_HISTORY[user_id].append({"role": "user", "content": user_text})
         
-        if len(CHAT_HISTORY[user_id]) > 10:
-            CHAT_HISTORY[user_id] = CHAT_HISTORY[user_id][-10:]
+        # Tarixni cheklash (oxirgi 6 ta xabar = 3 ta suhbat)
+        if len(CHAT_HISTORY[user_id]) > 6:
+            CHAT_HISTORY[user_id] = CHAT_HISTORY[user_id][-6:]
         
+        # Messages array yaratish (system message + user history)
         messages = [
             {
                 "role": "system",
-                "content": "Siz do'stona, hazilkash va yordam beruvchi yordamchi botsiz. O'zbekcha javob bering. Qisqa va samimiy javoblar bering (2-4 jumla). Emoji ishlating."
+                "content": "Sen o'zbekcha gaplashadigan do'stona yordamchi botsiz. Har doim O'ZBEKCHA javob ber. Qisqa va tushunarli javoblar ber. Emoji ishlataveringchi."
             }
-        ] + CHAT_HISTORY[user_id]
+        ]
+        
+        # Chat tarixini qo'shish
+        messages.extend(CHAT_HISTORY[user_id])
+        
+        # API so'rovini yuborish (system message bilan)
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": messages,
+            "temperature": 0.8,
+            "max_tokens": 400
+        }
+        
+        logger.info(f"📤 Groq so'rovi yuborilmoqda...")
+        logger.info(f"🔑 API Key boshi: {GROQ_API_KEY[:20]}..." if GROQ_API_KEY else "❌ API Key yo'q!")
+        logger.info(f"📝 Payload: {payload}")
         
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -136,26 +155,59 @@ async def chatbot_reply(user_text: str, user_id: int) -> str:
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 500
-            },
+            json=payload,
             timeout=30
         )
         
+        logger.info(f"📥 Groq response status: {response.status_code}")
+        
+        # Xatolik bo'lsa, to'liq response'ni log qilish
+        if response.status_code != 200:
+            try:
+                error_json = response.json()
+                logger.error(f"📄 Xatolik JSON: {error_json}")
+            except:
+                logger.error(f"📄 Xatolik TEXT: {response.text}")
+        
         if response.status_code == 200:
-            bot_reply = response.json()["choices"][0]["message"]["content"]
+            result = response.json()
+            bot_reply = result["choices"][0]["message"]["content"]
+            
+            # Assistant javobini tarixga qo'shish
             CHAT_HISTORY[user_id].append({"role": "assistant", "content": bot_reply})
+            
+            logger.info(f"✅ Javob muvaffaqiyatli olindi: {bot_reply[:50]}...")
             return bot_reply
+            
         else:
-            logger.error(f"Groq xatolik: {response.status_code}")
-            return f"❌ API xatolik ({response.status_code}). Keyinroq urinib ko'ring."
+            error_text = response.text
+            logger.error(f"❌ Groq API xatolik {response.status_code}")
+            logger.error(f"📄 Xatolik matni: {error_text}")
+            
+            # Xatolik turiga qarab javob
+            if response.status_code == 401:
+                return "❌ API kaliti noto'g'ri. Admin bilan bog'laning."
+            elif response.status_code == 429:
+                return "⏳ Juda ko'p so'rov. 1 daqiqa kutib, qayta urinib ko'ring."
+            elif response.status_code == 400:
+                # Tarixni tozalash va qaytadan urinish
+                CHAT_HISTORY[user_id] = []
+                return "🔄 Xatolik yuz berdi. Yangi suhbat boshlaymiz. Iltimos, qaytadan yozing."
+            else:
+                return f"❌ Xatolik ({response.status_code}). Keyinroq urinib ko'ring."
+        
+    except requests.exceptions.Timeout:
+        logger.error("⏱️ Groq API timeout")
+        return "⏱️ Server javob bermadi. Qaytadan urinib ko'ring."
+        
+    except requests.exceptions.ConnectionError:
+        logger.error("🌐 Internetga ulanishda xatolik")
+        return "🌐 Internet bilan bog'lanishda muammo."
         
     except Exception as e:
-        logger.error(f"Chatbot xatolik: {e}")
-        return f"❌ Xatolik: {str(e)}"
+        logger.error(f"❌ Chatbot kutilmagan xatolik: {str(e)}")
+        logger.exception(e)  # To'liq stack trace
+        return "❌ Kutilmagan xatolik. Qaytadan urinib ko'ring."
 
 # 🎯 START komandasi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
