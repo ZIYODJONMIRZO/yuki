@@ -15,6 +15,7 @@ from docx.oxml.ns import qn
 from dotenv import load_dotenv
 from flask import Flask, request
 import shutil
+import threading
 
 # .env faylni o'qish
 load_dotenv()
@@ -57,14 +58,14 @@ def health():
 
 # 🪝 Webhook endpoint
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
+async def webhook():
     """Telegram webhook handler"""
     try:
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
         
-        # Async update'ni process qilish
-        asyncio.run(telegram_app.process_update(update))
+        # Update'ni process qilish
+        await telegram_app.process_update(update)
         
         return "OK", 200
     except Exception as e:
@@ -140,7 +141,7 @@ async def chatbot_reply(user_text: str, user_id: int) -> str:
         logger.error(f"Chatbot xatolik: {e}")
         return f"❌ Xatolik: {str(e)}"
 
-# 🏁 START komandasi
+# 🎯 START komandasi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_STATE[update.message.from_user.id] = "main"
     await update.message.reply_text(
@@ -339,7 +340,6 @@ async def create_image_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ PDF yaratishda xatolik: {e}")
     
     finally:
-        # Fayllarni tozalash
         cleanup_user_data(user_id)
 
 # 🧾 Word → PDF funksiyasi
@@ -464,6 +464,33 @@ def cleanup_user_data(user_id):
     except Exception as e:
         logger.error(f"Tozalash xatolik: {e}")
 
+# 🚀 Webhook'ni asinxron sozlash
+async def setup_webhook():
+    """Webhook'ni to'g'ri sozlash"""
+    try:
+        webhook_path = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        
+        # Botni initialize qilish
+        await telegram_app.initialize()
+        await telegram_app.start()
+        
+        # Webhook o'rnatish
+        await telegram_app.bot.set_webhook(url=webhook_path)
+        
+        logger.info(f"✅ Webhook o'rnatildi: {webhook_path}")
+        
+        # Webhook statusini tekshirish
+        webhook_info = await telegram_app.bot.get_webhook_info()
+        logger.info(f"📡 Webhook info: {webhook_info.url}")
+        
+    except Exception as e:
+        logger.error(f"❌ Webhook sozlashda xatolik: {e}")
+
+# 🚀 Flask'ni alohida threadda ishga tushirish
+def run_flask():
+    """Flask'ni alohida threadda ishga tushirish"""
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
 # 🚀 Botni ishga tushirish
 def main():
     global telegram_app
@@ -485,12 +512,17 @@ def main():
         logger.info(f"🌐 Webhook: {WEBHOOK_URL}")
         logger.info(f"📡 Port: {PORT}")
         
-        # Webhook'ni o'rnatish
-        webhook_path = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        asyncio.run(telegram_app.bot.set_webhook(url=webhook_path))
+        # Flask'ni alohida threadda ishga tushirish
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
         
-        # Flask'ni ishga tushirish
-        app.run(host="0.0.0.0", port=PORT)
+        # Webhook'ni asinxron sozlash
+        asyncio.run(setup_webhook())
+        
+        # Botni ishlatish (blokirovka)
+        import time
+        while True:
+            time.sleep(1)
     else:
         # Polling rejimi (local)
         logger.info("🔄 Polling rejimi (local)")
