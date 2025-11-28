@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from flask import Flask, request
 import shutil
 import threading
+from queue import Queue
 
 # .env faylni o'qish
 load_dotenv()
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 # 🔑 API Keys
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not GROQ_API_KEY:
@@ -46,6 +47,7 @@ app = Flask(__name__)
 
 # Telegram bot app (global)
 telegram_app = None
+update_queue = Queue()
 
 # 🏥 Health check endpoint
 @app.route('/')
@@ -56,21 +58,35 @@ def home():
 def health():
     return {"status": "healthy", "bot": "running"}, 200
 
-# 🪝 Webhook endpoint
+# 🪝 Webhook endpoint (SYNC)
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
-async def webhook():
+def webhook():
     """Telegram webhook handler"""
     try:
         json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, telegram_app.bot)
+        logger.info(f"📨 Webhook qabul qilindi: {json_data}")
         
-        # Update'ni process qilish
-        await telegram_app.process_update(update)
+        # Update'ni queuega qo'shish
+        update_queue.put(json_data)
         
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook xatolik: {e}")
         return "Error", 500
+
+# 🔄 Update processor (async)
+async def process_updates():
+    """Queue'dan update'larni olish va process qilish"""
+    while True:
+        try:
+            if not update_queue.empty():
+                json_data = update_queue.get()
+                update = Update.de_json(json_data, telegram_app.bot)
+                await telegram_app.process_update(update)
+                logger.info(f"✅ Update qayta ishlandi")
+        except Exception as e:
+            logger.error(f"Process update xatolik: {e}")
+        await asyncio.sleep(0.1)
 
 # 📹 Asosiy menyu
 def main_menu():
@@ -143,7 +159,10 @@ async def chatbot_reply(user_text: str, user_id: int) -> str:
 
 # 🎯 START komandasi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    USER_STATE[update.message.from_user.id] = "main"
+    user_id = update.message.from_user.id
+    USER_STATE[user_id] = "main"
+    logger.info(f"👤 Foydalanuvchi {user_id} /start bosdi")
+    
     await update.message.reply_text(
         "👋 Salom! Men ko'p funksiyali botman:\n\n"
         "🖼 Rasmlarni PDF ga\n"
@@ -474,14 +493,26 @@ async def setup_webhook():
         await telegram_app.initialize()
         await telegram_app.start()
         
-        # Webhook o'rnatish
-        await telegram_app.bot.set_webhook(url=webhook_path)
+        # Avvalgi webhook'ni o'chirish
+        await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("🗑️ Eski webhook o'chirildi")
+        
+        # Yangi webhook o'rnatish
+        await telegram_app.bot.set_webhook(
+            url=webhook_path,
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"]
+        )
         
         logger.info(f"✅ Webhook o'rnatildi: {webhook_path}")
         
         # Webhook statusini tekshirish
         webhook_info = await telegram_app.bot.get_webhook_info()
-        logger.info(f"📡 Webhook info: {webhook_info.url}")
+        logger.info(f"📡 Webhook URL: {webhook_info.url}")
+        logger.info(f"📊 Pending updates: {webhook_info.pending_update_count}")
+        
+        if webhook_info.last_error_message:
+            logger.error(f"⚠️ Webhook xatolik: {webhook_info.last_error_message}")
         
     except Exception as e:
         logger.error(f"❌ Webhook sozlashda xatolik: {e}")
@@ -490,6 +521,12 @@ async def setup_webhook():
 def run_flask():
     """Flask'ni alohida threadda ishga tushirish"""
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+# 🔄 Async event loop'ni alohida threadda ishga tushirish
+def run_async_loop(loop):
+    """Async event loop'ni ishga tushirish"""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
 # 🚀 Botni ishga tushirish
 def main():
@@ -512,17 +549,23 @@ def main():
         logger.info(f"🌐 Webhook: {WEBHOOK_URL}")
         logger.info(f"📡 Port: {PORT}")
         
-        # Flask'ni alohida threadda ishga tushirish
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
+        # Yangi event loop yaratish
+        loop = asyncio.new_event_loop()
         
-        # Webhook'ni asinxron sozlash
-        asyncio.run(setup_webhook())
+        # Async loop'ni alohida threadda ishga tushirish
+        async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
+        async_thread.start()
         
-        # Botni ishlatish (blokirovka)
-        import time
-        while True:
-            time.sleep(1)
+        # Webhook'ni sozlash
+        asyncio.run_coroutine_threadsafe(setup_webhook(), loop)
+        
+        # Update processor'ni ishga tushirish
+        asyncio.run_coroutine_threadsafe(process_updates(), loop)
+        
+        # Flask'ni asosiy threadda ishga tushirish
+        logger.info("🚀 Flask serveri ishga tushmoqda...")
+        run_flask()
+        
     else:
         # Polling rejimi (local)
         logger.info("🔄 Polling rejimi (local)")
